@@ -128,6 +128,7 @@ func (bq *BadQ) toggleScan() {
 	}
 }
 
+// Open database, start accepting and executing jobs
 func (bq *BadQ) Start() error {
 	if bq.opt.Db != nil {
 		bq.db = bq.opt.Db
@@ -174,6 +175,31 @@ func (bq *BadQ) Start() error {
 	return nil
 }
 
+// Returns number of pending messages for each priority
+func (bq *BadQ) PrioStats() map[uint8]uint64 {
+	stats := make(map[uint8]uint64)
+	if bq.stopping.Load() {
+		return stats // empty
+	}
+	bq.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		opts.Prefix = bq.opt.KeyPrefix
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		for it.Rewind(); it.Valid(); it.Next() {
+			key_data := it.Item().Key()
+			prio, _, key_err := bq.decode_key(key_data)
+			if nil != key_err {
+				continue // ignore bad key...
+			}
+			stats[prio] += 1
+		}
+		return nil
+	})
+	return stats
+}
+
 // Stop processing and close the database, waiting for current processing functions to finish
 func (bq *BadQ) Stop() {
 	if !bq.stopping.CompareAndSwap(false, true) {
@@ -183,6 +209,11 @@ func (bq *BadQ) Stop() {
 	close(bq.inq)
 	bq.runningHandlers.Wait() // wait for inbound queue p rocessor and active proc funcs
 	bq.db.Close()
+}
+
+// Returns true if badq is started
+func (bq *BadQ) IsRunning() bool {
+	return !bq.stopping.Load()
 }
 
 // Access to underlying database handle
