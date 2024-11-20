@@ -1,33 +1,9 @@
 package badq
 
 /*
-BadQ: Embeddable, persistent priority job queue backed by Badger key-value database.
+BadQ: Pure Go, embeddable, persistent priority job queue, backed by Badger key-value database.
 
-# Features
- - 256 job priorities
- - Concurrent processing (concurrency level set via Options)
- - input job queue coalescing to reduce number of database transactions
- - graceful shutdown
-
-# Example
-
-	bq := NewBadQWithLogger("db_path", nil, func(jid uint64, job []byte) JobResult {
-		fmt.Printf("Processed job with id %d: %s\n", jid, string(job))
-		time.Sleep(time.Second)
-		return JOB_RESULT_DONE
-	})
-	bq.Push(1, "first")
-	bq.Push(1, "second")
-	bq.Push(1, "third")
-	bq.push(0, "fourth") // will be processed with higher priority
-
-# Caution
- BadQ uses gob encoding by default, therefore you should gob.Register your job data structure.
- Or you can set custom marshal/unmarshal methods via Options.
-
-# License
- Whatever
-
+details: https://github.com/pantonov/badq
 */
 
 import (
@@ -53,6 +29,13 @@ type Options struct {
 
 	// Write batch queue length (default: 1024)
 	WriteBatchLen int
+
+	// Key prefix in the database (default: nil). If you use prefixes, make sure they don't overlap!
+	// (for example, empty prefix matches everything)
+	KeyPrefix []byte
+
+	// Use already opened database (default: open)
+	Db *badger.DB
 
 	// Badger options (default: badger.DefaultOptions)
 	BadgerOptions badger.Options
@@ -87,6 +70,7 @@ type BadQ struct {
 	stopping        atomic.Bool
 	runningHandlers sync.WaitGroup
 	rescan          chan (bool)
+	numJobs         atomic.Int64
 }
 
 // Job handler function. Must return PROC_RESULT_DONE or PROC_RESULT_REQUEUE.
@@ -105,8 +89,8 @@ func NewBadQWithOptions(opt *Options, pf JobFunc) *BadQ {
 	return &bq
 }
 
-// Create BadQ instance with default options and open persistence database.
-func NewBadQWithLogger(dbPath string, log badger.Logger, pf JobFunc) *BadQ {
+// Create typical BadQ instance with default options and open persistence database.
+func NewBadQ(dbPath string, log badger.Logger, pf JobFunc) *BadQ {
 	opt := DefaultOptions(dbPath, log)
 	if log != nil {
 		opt.BadgerOptions.Logger = log
@@ -124,10 +108,12 @@ func (bq *BadQ) Push(prio uint8, job []byte) error {
 	if bq.stopping.Load() {
 		return fmt.Errorf("badq: instance is already stopped")
 	}
+	kp := bq.opt.KeyPrefix
 	ki := bq.seq.Add(1)
-	key := make([]byte, 8)
-	binary.BigEndian.PutUint64(key, ki)
-	key[0] = prio
+	key := make([]byte, 8+len(kp))
+	binary.BigEndian.PutUint64(key[len(kp):], ki)
+	key[len(kp)] = prio
+	copy(key, bq.opt.KeyPrefix)
 	bq.inq <- &kv{key: key, value: job}
 	return nil
 }
@@ -143,37 +129,44 @@ func (bq *BadQ) toggleScan() {
 }
 
 func (bq *BadQ) Start() error {
-	db, err := badger.Open(bq.opt.BadgerOptions)
-	if err != nil {
-		return err
+	if bq.opt.Db != nil {
+		bq.db = bq.opt.Db
+	} else {
+		if db, err := badger.Open(bq.opt.BadgerOptions); nil != err {
+			return err
+		} else {
+			bq.db = db
+			bq.RunGC()
+		}
 	}
-	bq.db = db
-	bq.RunGC()
 	// get latest sequence number by scanning keys
 	if err := bq.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
+		opts.Prefix = bq.opt.KeyPrefix
 		it := txn.NewIterator(opts)
 		defer it.Close()
-		start_seq := uint64(0)
+		start_seq, num_jobs := uint64(0), int64(0)
 		for it.Rewind(); it.Valid(); it.Next() {
 			key_data := it.Item().Key()
-			bq.log().Infof("loaded key: %+v", key_data)
-			if len(key_data) != 8 {
-				bq.log().Errorf("badger data load: invalid key length %d")
-				continue
+			//bq.log().Infof("read key=%+v", key_data)
+			_, seq, key_err := bq.decode_key(key_data)
+			if nil != key_err {
+				bq.log().Errorf("%s", key_err)
+				continue // ignore bad key...
 			}
-			_, seq := decode_key(it.Item().Key())
 			if start_seq < seq {
 				start_seq = seq
 			}
+			num_jobs += 1
 		}
 		bq.seq.Store(start_seq + 1)
+		bq.numJobs.Store(num_jobs)
 		return nil
 	}); nil != err {
 		return err
 	}
-	bq.log().Infof("badq: last job sequence=%d", bq.seq.Load())
+	bq.log().Infof("badq: number of stored jobs=%d, last job sequence=%d", bq.numJobs.Load(), bq.seq.Load())
 	bq.stopping.Store(false)
 	bq.runningHandlers.Add(2)
 	go bq.runIn()
@@ -188,7 +181,7 @@ func (bq *BadQ) Stop() {
 	}
 	close(bq.rescan)
 	close(bq.inq)
-	bq.runningHandlers.Wait() // wait for inbound queue processor and active proc funcs
+	bq.runningHandlers.Wait() // wait for inbound queue p rocessor and active proc funcs
 	bq.db.Close()
 }
 
@@ -208,6 +201,7 @@ func (bq *BadQ) runIn() {
 			if err := txn.Set(vp.key, vp.value); nil != err {
 				return err
 			}
+			bq.numJobs.Add(1)
 			// coalesce remaining items in input queue
 		qloop:
 			for i := 0; len(bq.inq) > 0 && i < cap(bq.inq); i += 1 {
@@ -219,6 +213,7 @@ func (bq *BadQ) runIn() {
 					if err := txn.Set(iv.key, iv.value); nil != err {
 						return err
 					}
+					bq.numJobs.Add(1)
 				default:
 					break qloop
 				}
@@ -238,12 +233,16 @@ func (bq *BadQ) runOut() {
 		if err := bq.db.View(func(txn *badger.Txn) error {
 			opts := badger.DefaultIteratorOptions
 			opts.PrefetchSize = 1
+			opts.Prefix = bq.opt.KeyPrefix
 			it := txn.NewIterator(opts)
 			defer it.Close()
 			for it.Rewind(); it.Valid(); it.Next() {
 				item := it.Item()
 				k := item.Key()
-				prio, jobid := decode_key(k)
+				prio, jobid, key_err := bq.decode_key(k)
+				if nil != key_err {
+					continue // ignore bad key, it will be reported on start-up
+				}
 				if func() bool {
 					bq.jobsLock.Lock()
 					defer bq.jobsLock.Unlock()
@@ -300,6 +299,7 @@ func (bq *BadQ) delete_job(k []byte) {
 	}); nil != err {
 		bq.opt.BadgerOptions.Logger.Errorf("badq: error while deleting key: %s", err)
 	}
+	bq.numJobs.Add(-1)
 }
 
 func (bq *BadQ) requeue_job(prio uint8, k, v []byte) {
@@ -319,11 +319,19 @@ func (bq *BadQ) requeue_job(prio uint8, k, v []byte) {
 	}
 }
 
+func (bq *BadQ) NumJobs() int64 {
+	return bq.numJobs.Load()
+}
+
 func (bq *BadQ) log() badger.Logger {
 	return bq.opt.BadgerOptions.Logger
 }
 
-func decode_key(data []byte) (uint8, uint64) {
+func (bq *BadQ) decode_key(key_data []byte) (uint8, uint64, error) {
+	if len(key_data) != 8+len(bq.opt.KeyPrefix) {
+		return 0, 0, fmt.Errorf("badq: invalid key length '%d' in storage, key: %+v", len(bq.opt.KeyPrefix), bq.opt.KeyPrefix)
+	}
+	data := key_data[len(bq.opt.KeyPrefix):]
 	v := binary.BigEndian.Uint64(data)
-	return data[0], v & 0xffffffffffffff
+	return data[0], v & 0xffffffffffffff, nil
 }
