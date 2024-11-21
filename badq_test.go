@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-const total_jobs = 10000
+const total_jobs = 100000
 
 var completedJobs = atomic.Int64{}
 
@@ -31,7 +31,10 @@ func Test1(t *testing.T) {
 		prio := i % 111 // enqueue with different priorities (scattered write)
 		q.Push(uint8(prio), []byte(fmt.Sprintf("job_seq=%d,prio=%d", i, prio)))
 	}
-	time.Sleep(30 * time.Second)
+	// set a upper time limit
+	for cnt := 0; completedJobs.Load() != total_jobs && cnt < total_jobs/100; cnt += 1 {
+		time.Sleep(10 * time.Millisecond)
+	}
 	q.Stop()
 	if completedJobs.Load() != total_jobs {
 		t.Fatalf("completed jobs number mismatch %d != %d", completedJobs.Load(), total_jobs)

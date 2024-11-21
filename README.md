@@ -1,7 +1,5 @@
-WIP
-
 # badq
-Extermely simple, embeddable, persistent work queue in pure Go, backed by Badger
+Simple, embeddable, persistent work queue in pure Go, backed by Badger
 
 # Features
  - 256 job priorities
