@@ -119,6 +119,9 @@ func NewBadQ(dbPath string, log badger.Logger, pf JobFunc) *BadQ {
 
 // Run values garbage collection
 func (bq *BadQ) RunGC() {
+	if bq.stopping.Load() {
+		return
+	}
 	bq.db.RunValueLogGC(0.5)
 }
 
