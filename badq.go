@@ -10,10 +10,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"runtime/debug"
+	"slices"
 	"sync"
 	"sync/atomic"
 
 	"github.com/dgraph-io/badger/v4"
+	rbt "github.com/emirpasic/gods/trees/redblacktree"
 )
 
 // Return value of the job handler. May be PROC_RESULT_DONE, or PROC_RESULT_REQUEUE (put the job back at the end of the queue)
@@ -28,7 +30,6 @@ type Options struct {
 	// Max handlers running in parallel (default: 1)
 	Concurrency uint
 
-	// Write batch queue length (default: 1024)
 	WriteBatchLen int
 
 	// Disable badger sync writes
@@ -63,32 +64,20 @@ type kv struct {
 	value []byte
 }
 
-type jobStateData struct {
-	d     kv // raw key/value pair
-	state jobState
-}
-
-type jobState uint8
-
-const (
-	jobState_None      jobState = 0
-	jobState_Running   jobState = 2
-	jobState_Completed jobState = 3
-	jobState_Requeue   jobState = 4
-)
-
 type BadQ struct {
 	opt             *Options
 	db              *badger.DB
 	inq             chan (*kv)
 	seq             atomic.Uint64
-	jobs            map[uint64]jobStateData
-	jobsLock        sync.Mutex
+	q               *rbt.Tree
+	qlock           sync.Mutex
 	handler         JobFunc
 	stopping        atomic.Bool
 	runningHandlers sync.WaitGroup
 	rescan          chan (bool)
 	numJobs         atomic.Int64
+	outWait         chan (bool)
+	dbWait          chan (bool)
 }
 
 // Job handler function. Must return PROC_RESULT_DONE or PROC_RESULT_REQUEUE.
@@ -101,10 +90,12 @@ func NewBadQWithOptions(opt *Options, pf JobFunc) *BadQ {
 		inq: make(chan (*kv), opt.WriteBatchLen),
 	}
 	opt.BadgerOptions.SyncWrites = !opt.DisableSyncWrites
+	bq.q = rbt.NewWith(func(a, b interface{}) int { return slices.Compare(a.([]byte), b.([]byte)) })
 	bq.stopping.Store(true)
 	bq.handler = pf
-	bq.jobs = make(map[uint64]jobStateData)
 	bq.rescan = make(chan bool, 1)
+	bq.outWait = make(chan bool, 1)
+	bq.dbWait = make(chan bool, 1)
 	return &bq
 }
 
@@ -126,9 +117,10 @@ func (bq *BadQ) RunGC() {
 }
 
 // Enqueue job item with given priority. 0 is the highest priority, 255 the lowest
-func (bq *BadQ) Push(prio uint8, job []byte) error {
+// Returns unique job id in queue
+func (bq *BadQ) Push(prio uint8, job []byte) (uint64, error) {
 	if bq.stopping.Load() {
-		return fmt.Errorf("badq: instance is already stopped")
+		return 0, fmt.Errorf("badq: instance is already stopped")
 	}
 	kp := bq.opt.KeyPrefix
 	ki := bq.seq.Add(1)
@@ -137,9 +129,14 @@ func (bq *BadQ) Push(prio uint8, job []byte) error {
 	key[len(kp)] = prio
 	copy(key, bq.opt.KeyPrefix)
 	bq.inq <- &kv{key: key, value: job}
-	return nil
+	bq.qlock.Lock()
+	bq.q.Put(key, job)
+	bq.qlock.Unlock()
+	bq.numJobs.Add(1)
+	return ki, nil
 }
 
+// todo: use len(concuurrency)
 func (bq *BadQ) toggleScan() {
 	if bq.stopping.Load() {
 		return
@@ -162,21 +159,28 @@ func (bq *BadQ) Start() error {
 			bq.RunGC()
 		}
 	}
+	bq.qlock.Lock()
+	defer bq.qlock.Unlock()
 	// get latest sequence number by scanning keys
 	if err := bq.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = false
 		opts.Prefix = bq.opt.KeyPrefix
 		it := txn.NewIterator(opts)
 		defer it.Close()
 		start_seq, num_jobs := uint64(0), int64(0)
 		for it.Rewind(); it.Valid(); it.Next() {
-			key_data := it.Item().Key()
+			key_data := it.Item().KeyCopy(nil)
 			//bq.log().Infof("read key=%+v", key_data)
-			_, seq, key_err := bq.decode_key(key_data)
-			if nil != key_err {
-				bq.log().Errorf("%s", key_err)
+			_, seq, err := bq.decode_key(key_data)
+			if nil != err {
+				bq.log().Errorf("%s", err)
 				continue // ignore bad key...
+			}
+			if v, err := it.Item().ValueCopy(nil); nil != err {
+				bq.log().Errorf("%s", err)
+				continue
+			} else {
+				bq.q.Put(key_data, v)
 			}
 			if start_seq < seq {
 				start_seq = seq
@@ -191,9 +195,11 @@ func (bq *BadQ) Start() error {
 	}
 	bq.log().Infof("badq: number of stored jobs=%d, last job sequence=%d", bq.numJobs.Load(), bq.seq.Load())
 	bq.stopping.Store(false)
-	bq.runningHandlers.Add(2)
 	go bq.runIn()
 	go bq.runOut()
+	for i := 0; i < int(bq.opt.Concurrency); i += 1 {
+		bq.toggleScan()
+	}
 	return nil
 }
 
@@ -203,22 +209,15 @@ func (bq *BadQ) PrioStats() map[uint8]uint64 {
 	if bq.stopping.Load() {
 		return stats // empty
 	}
-	bq.db.View(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = false
-		opts.Prefix = bq.opt.KeyPrefix
-		it := txn.NewIterator(opts)
-		defer it.Close()
-		for it.Rewind(); it.Valid(); it.Next() {
-			key_data := it.Item().Key()
-			prio, _, key_err := bq.decode_key(key_data)
-			if nil != key_err {
-				continue // ignore bad key...
-			}
-			stats[prio] += 1
+	bq.qlock.Lock()
+	defer bq.qlock.Unlock()
+	for it := bq.q.Iterator(); it.Next(); {
+		prio, _, key_err := bq.decode_key(it.Key().([]byte))
+		if nil != key_err {
+			continue // ignore bad key...
 		}
-		return nil
-	})
+		stats[prio] += 1
+	}
 	return stats
 }
 
@@ -228,8 +227,10 @@ func (bq *BadQ) Stop() {
 		return // already stopping
 	}
 	close(bq.rescan)
-	close(bq.inq)
-	bq.runningHandlers.Wait() // wait for inbound queue p rocessor and active proc funcs
+	bq.runningHandlers.Wait() // wait for running handlers
+	<-bq.outWait
+	bq.inq <- &kv{}
+	<-bq.dbWait
 	bq.db.Close()
 }
 
@@ -244,142 +245,106 @@ func (bq *BadQ) Db() *badger.DB {
 }
 
 func (bq *BadQ) runIn() {
-	defer bq.runningHandlers.Done()
+	defer func() {
+		bq.dbWait <- true
+	}()
+	stop := false
 	for {
-		vp, ok := <-bq.inq
-		if !ok {
+		vp := <-bq.inq
+		if vp.key == nil { // flush and return
 			return
 		}
 		if err := bq.db.Update(func(txn *badger.Txn) error {
-			if err := txn.Set(vp.key, vp.value); nil != err {
+			update_or_del := func(vv *kv) error {
+				if vv.value == nil {
+					return txn.Delete(vv.key)
+				} else {
+					return txn.Set(vv.key, vv.value)
+				}
+			}
+			if err := update_or_del(vp); nil != err {
 				return err
 			}
-			bq.numJobs.Add(1)
 			// coalesce remaining items in input queue
 		qloop:
 			for i := 0; len(bq.inq) > 0 && i < cap(bq.inq); i += 1 {
 				select {
 				case iv, iok := <-bq.inq:
-					if !iok {
+					if !iok || iv.key == nil {
+						stop = true
 						break
 					}
-					if err := txn.Set(iv.key, iv.value); nil != err {
+					if err := update_or_del(iv); nil != err {
 						return err
 					}
-					bq.numJobs.Add(1)
 				default:
 					break qloop
 				}
 			}
 			return nil
 		}); nil != err {
-			bq.log().Errorf("badger enqueue error: %s", err)
-			continue
+			bq.log().Errorf("badger update error: %s", err)
 		}
-		bq.toggleScan()
-	}
-}
-
-func (bq *BadQ) runOut() {
-	defer bq.runningHandlers.Done()
-	var activeJobs atomic.Int64
-	for {
-		if activeJobs.Load() >= int64(bq.opt.Concurrency) {
-			continue // wait for next iteration
-		}
-		if err := bq.db.Update(func(txn *badger.Txn) error {
-			bq.jobsLock.Lock()
-			for k, jd := range bq.jobs {
-				if jd.state == jobState_Completed || jd.state == jobState_Requeue {
-					if err := txn.Delete(jd.d.key); nil != err {
-						bq.log().Errorf("badq: error deleting completed job id %d", k)
-					}
-					delete(bq.jobs, k)
-				}
-				if jd.state == jobState_Requeue {
-					bq.Push(jd.d.key[len(bq.opt.KeyPrefix)], jd.d.value)
-				}
-			}
-			bq.jobsLock.Unlock()
-			opts := badger.DefaultIteratorOptions
-			opts.PrefetchSize = 1
-			opts.Prefix = bq.opt.KeyPrefix
-			it := txn.NewIterator(opts)
-			defer it.Close()
-			for it.Rewind(); it.Valid(); it.Next() {
-				item := it.Item()
-				k := item.Key()
-				_, jobid, key_err := bq.decode_key(k)
-				if nil != key_err {
-					continue // ignore bad key, it will be reported on start-up
-				}
-				if activeJobs.Load() >= int64(bq.opt.Concurrency) {
-					break // wait for next iteration
-				}
-				bq.jobsLock.Lock()
-				js := bq.jobs[jobid].state
-				bq.jobsLock.Unlock()
-				if js == jobState_Running || js == jobState_Completed {
-					continue
-				}
-				vcp, err := item.ValueCopy(nil)
-				if nil != err {
-					bq.setJobState(jobid, jobState_None)
-					return err
-				}
-				kcp := item.KeyCopy(nil)
-				bq.runningHandlers.Add(1)
-				activeJobs.Add(1)
-				bq.jobsLock.Lock()
-				bq.jobs[jobid] = jobStateData{state: jobState_Running, d: kv{key: kcp, value: vcp}}
-				bq.jobsLock.Unlock()
-				go func() {
-					defer func() {
-						if r := recover(); r != nil {
-							bq.log().Errorf("badq handler recover, job id %d: stack trace:\n%s", jobid, string(debug.Stack()))
-						}
-						bq.jobsLock.Lock()
-						jd := bq.jobs[jobid]
-						if jd.state != jobState_Completed && jd.state != jobState_Requeue {
-							jd.state = jobState_Completed
-							bq.jobs[jobid] = jd
-						}
-						bq.jobsLock.Unlock()
-						bq.toggleScan()
-						bq.runningHandlers.Done()
-						activeJobs.Add(-1)
-					}()
-					switch bq.handler(jobid, vcp) {
-					case JOB_RESULT_DONE:
-						bq.setJobState(jobid, jobState_Completed)
-					case JOB_RESULT_REQUEUE:
-						bq.setJobState(jobid, jobState_Requeue)
-					default:
-						panic("badq: unknown result value from handler function")
-					}
-				}()
-			}
-			return nil
-		}); nil != err {
-			bq.log().Errorf("badq out-queue: tx error: %s", err)
-		}
-		_, ok := <-bq.rescan
-		if !ok {
+		if stop {
 			return
 		}
 	}
 }
 
-func (bq *BadQ) setJobState(jobid uint64, js jobState) {
-	bq.jobsLock.Lock()
-	if js == jobState_None {
-		delete(bq.jobs, jobid)
-	} else {
-		jd := bq.jobs[jobid]
-		jd.state = js
-		bq.jobs[jobid] = jd
+func (bq *BadQ) runOut() {
+	defer func() {
+		bq.outWait <- true
+	}()
+	tickets := make(chan bool, bq.opt.Concurrency)
+	for i := 0; i < int(bq.opt.Concurrency); i += 1 {
+		tickets <- true
 	}
-	bq.jobsLock.Unlock()
+	for {
+		if bq.stopping.Load() {
+			return
+		}
+		_, ok := <-bq.rescan
+		if !ok {
+			return
+		}
+		for {
+			bq.qlock.Lock()
+			node := bq.q.Left()
+			if nil == node {
+				bq.qlock.Unlock()
+				break
+			}
+			key := node.Key.([]byte)
+			value := node.Value.([]byte)
+			bq.q.Remove(node.Key)
+			bq.qlock.Unlock()
+			bq.numJobs.Add(-1)
+			<-tickets
+			if bq.stopping.Load() {
+				break
+			}
+			bq.inq <- &kv{key: key} // request db deletion
+			bq.runningHandlers.Add(1)
+			go func() {
+				prio, jobid, _ := bq.decode_key(key)
+				defer func() {
+					if r := recover(); r != nil {
+						bq.log().Errorf("badq handler recover, job id %d: stack trace:\n%s", jobid, string(debug.Stack()))
+					}
+					bq.toggleScan()
+					tickets <- true
+					bq.runningHandlers.Done()
+				}()
+				switch bq.handler(jobid, value) {
+				case JOB_RESULT_DONE:
+				case JOB_RESULT_REQUEUE:
+					bq.Push(prio, value)
+				default:
+					panic("badq: unknown result value from handler function")
+				}
+			}()
+		}
+	}
 }
 
 func (bq *BadQ) NumJobs() int64 {
