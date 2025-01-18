@@ -133,6 +133,7 @@ func (bq *BadQ) Push(prio uint8, job []byte) (uint64, error) {
 	bq.q.Put(key, job)
 	bq.qlock.Unlock()
 	bq.numJobs.Add(1)
+	bq.toggleScan()
 	return ki, nil
 }
 
@@ -197,9 +198,7 @@ func (bq *BadQ) Start() error {
 	bq.stopping.Store(false)
 	go bq.runIn()
 	go bq.runOut()
-	for i := 0; i < int(bq.opt.Concurrency); i += 1 {
-		bq.toggleScan()
-	}
+	bq.toggleScan()
 	return nil
 }
 
