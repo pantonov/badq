@@ -222,12 +222,25 @@ func (bq *BadQ) PrioStats() map[uint8]uint64 {
 
 // Stop processing and close the database, waiting for current processing functions to finish
 func (bq *BadQ) Stop() {
+	bq.do_stop(true)
+}
+
+// Forcibly stop processing and close the database: finish processing input queue,
+// but do not wait for the output processing to complete.
+func (bq *BadQ) ForceStop() {
+	bq.do_stop(false)
+}
+
+// Stop processing and close the database, waiting for current processing functions to finish
+func (bq *BadQ) do_stop(wait_out bool) {
 	if !bq.stopping.CompareAndSwap(false, true) {
 		return // already stopping
 	}
 	close(bq.rescan)
-	bq.runningHandlers.Wait() // wait for running handlers
-	<-bq.outWait
+	if wait_out {
+		bq.runningHandlers.Wait() // wait for running handlers
+		<-bq.outWait
+	}
 	bq.inq <- &kv{}
 	<-bq.dbWait
 	bq.db.Close()
